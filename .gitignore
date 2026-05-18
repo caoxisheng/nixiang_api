@@ -23,6 +23,8 @@ build/
 # Debug logs (generated when DEBUG_MODE is enabled)
 debug_logs*/
 debug*.json
+server.stdout.log
+server.stderr.log
 
 # Project-specific
 _notes/
