@@ -43,8 +43,12 @@ import argparse
 import asyncio
 import json
 import logging
-import sys
 import os
+import signal
+import socket
+import subprocess
+import sys
+import time
 from contextlib import asynccontextmanager
 from pathlib import Path
 
@@ -590,6 +594,454 @@ UVICORN_LOG_CONFIG = {
     },
 }
 
+SERVER_RUNTIME_FILE = Path(".server-runtime.json")
+PORT_RELEASE_TIMEOUT_SECONDS = 5.0
+PORT_RELEASE_POLL_INTERVAL_SECONDS = 0.1
+MAX_PORT_SCAN_ATTEMPTS = 100
+
+
+def get_server_runtime_file_path() -> Path:
+    """
+    Return the runtime file path used to track the active server instance.
+
+    Returns:
+        Path to the runtime metadata file.
+    """
+    return SERVER_RUNTIME_FILE
+
+
+def get_port_probe_host(host: str) -> str:
+    """
+    Convert bind host to a host suitable for local port probing.
+
+    Args:
+        host: Bind host used by uvicorn.
+
+    Returns:
+        Local host value suitable for connection checks.
+    """
+    if host == "0.0.0.0":
+        return "127.0.0.1"
+    if host == "::":
+        return "::1"
+    return host
+
+
+def is_port_in_use(host: str, port: int) -> bool:
+    """
+    Check whether a TCP port is currently accepting local connections.
+
+    Args:
+        host: Host to probe.
+        port: TCP port to probe.
+
+    Returns:
+        True if the port is in use, otherwise False.
+    """
+    probe_host = get_port_probe_host(host)
+    socket_family = socket.AF_INET6 if ":" in probe_host else socket.AF_INET
+
+    try:
+        with socket.socket(socket_family, socket.SOCK_STREAM) as sock:
+            sock.settimeout(0.2)
+            return sock.connect_ex((probe_host, port)) == 0
+    except OSError:
+        return False
+
+
+def remove_server_runtime_file(pid_file_path: Path) -> None:
+    """
+    Remove server runtime metadata file if it exists.
+
+    Args:
+        pid_file_path: Runtime metadata file path.
+    """
+    try:
+        pid_file_path.unlink(missing_ok=True)
+    except OSError as exc:
+        logger.debug(f"Could not remove runtime file {pid_file_path}: {exc}")
+
+
+def read_server_runtime_info(pid_file_path: Path) -> tuple[int | None, int | None]:
+    """
+    Read tracked server runtime metadata from disk.
+
+    Supports both the new JSON format and legacy plain PID content.
+
+    Args:
+        pid_file_path: Runtime metadata file path.
+
+    Returns:
+        Tuple of (pid, port). Missing values are returned as None.
+    """
+    if not pid_file_path.exists():
+        return None, None
+
+    try:
+        raw_content = pid_file_path.read_text(encoding="utf-8").strip()
+    except OSError as exc:
+        logger.warning(f"Could not read runtime file {pid_file_path}: {exc}")
+        return None, None
+
+    if not raw_content:
+        remove_server_runtime_file(pid_file_path)
+        return None, None
+
+    if raw_content.isdigit():
+        return int(raw_content), None
+
+    try:
+        payload = json.loads(raw_content)
+    except json.JSONDecodeError:
+        logger.warning(f"Invalid runtime file content in {pid_file_path}, removing it")
+        remove_server_runtime_file(pid_file_path)
+        return None, None
+
+    raw_pid = payload.get("pid")
+    raw_port = payload.get("port")
+
+    pid = int(raw_pid) if str(raw_pid).isdigit() else None
+    port = int(raw_port) if str(raw_port).isdigit() else None
+    return pid, port
+
+
+def write_server_runtime_info(
+    pid_file_path: Path,
+    port: int,
+    current_pid: int | None = None,
+) -> None:
+    """
+    Persist current server runtime metadata for the next startup.
+
+    Args:
+        pid_file_path: Runtime metadata file path.
+        port: Bound TCP port for the current server.
+        current_pid: Optional PID override for testing.
+    """
+    runtime_info = {
+        "pid": current_pid or os.getpid(),
+        "port": port,
+    }
+    pid_file_path.write_text(
+        json.dumps(runtime_info, ensure_ascii=True),
+        encoding="utf-8",
+    )
+
+
+def cleanup_server_runtime_info(
+    pid_file_path: Path,
+    current_pid: int | None = None,
+) -> None:
+    """
+    Remove runtime metadata for the current server instance on shutdown.
+
+    Args:
+        pid_file_path: Runtime metadata file path.
+        current_pid: Optional PID override for testing.
+    """
+    active_pid = current_pid or os.getpid()
+    stored_pid, _ = read_server_runtime_info(pid_file_path)
+    if stored_pid == active_pid:
+        remove_server_runtime_file(pid_file_path)
+
+
+def process_exists(pid: int) -> bool:
+    """
+    Check whether a process exists.
+
+    Args:
+        pid: Process identifier.
+
+    Returns:
+        True if the process exists, otherwise False.
+    """
+    try:
+        os.kill(pid, 0)
+        return True
+    except PermissionError:
+        return True
+    except OSError:
+        return False
+
+
+def terminate_process(pid: int) -> None:
+    """
+    Terminate a process by PID.
+
+    Args:
+        pid: Process identifier.
+    """
+    if sys.platform == "win32":
+        subprocess.run(
+            ["taskkill", "/PID", str(pid), "/T", "/F"],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        return
+
+    os.kill(pid, signal.SIGTERM)
+
+
+def wait_for_port_release(
+    host: str,
+    port: int,
+    timeout_seconds: float = PORT_RELEASE_TIMEOUT_SECONDS,
+) -> bool:
+    """
+    Wait until a TCP port is released.
+
+    Args:
+        host: Host to probe.
+        port: Port to wait for.
+        timeout_seconds: Maximum wait time.
+
+    Returns:
+        True if the port becomes free before timeout, otherwise False.
+    """
+    deadline = time.monotonic() + timeout_seconds
+    while time.monotonic() < deadline:
+        if not is_port_in_use(host, port):
+            return True
+        time.sleep(PORT_RELEASE_POLL_INTERVAL_SECONDS)
+
+    return not is_port_in_use(host, port)
+
+
+def find_listening_pid_for_port(host: str, port: int) -> int | None:
+    """
+    Find the PID of the process listening on a TCP port.
+
+    Args:
+        host: Expected bind host.
+        port: Listening port.
+
+    Returns:
+        Listener PID if found, otherwise None.
+    """
+    normalized_host = get_port_probe_host(host)
+
+    if sys.platform == "win32":
+        result = subprocess.run(
+            ["netstat", "-ano", "-p", "TCP"],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+
+        for raw_line in result.stdout.splitlines():
+            line = raw_line.strip()
+            if "LISTENING" not in line.upper():
+                continue
+
+            parts = line.split()
+            if len(parts) < 5:
+                continue
+
+            local_address = parts[1]
+            if not local_address.endswith(f":{port}"):
+                continue
+
+            if host not in {"0.0.0.0", "::"}:
+                if not (
+                    local_address.startswith(f"{normalized_host}:")
+                    or local_address.startswith(f"[{normalized_host}]")
+                ):
+                    continue
+
+            pid_text = parts[-1]
+            if pid_text.isdigit():
+                return int(pid_text)
+
+        return None
+
+    result = subprocess.run(
+        ["lsof", "-ti", f"TCP:{port}", "-sTCP:LISTEN"],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    pid_text = result.stdout.strip().splitlines()
+    if pid_text and pid_text[0].isdigit():
+        return int(pid_text[0])
+    return None
+
+
+def get_process_command_line(pid: int) -> str | None:
+    """
+    Retrieve the command line for a running process.
+
+    Args:
+        pid: Process identifier.
+
+    Returns:
+        Command line string if available, otherwise None.
+    """
+    if sys.platform == "win32":
+        script = (
+            f'$process = Get-CimInstance Win32_Process -Filter "ProcessId = {pid}"; '
+            'if ($process) { $process.CommandLine }'
+        )
+        result = subprocess.run(
+            ["powershell", "-NoProfile", "-Command", script],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        command_line = result.stdout.strip()
+        return command_line or None
+
+    result = subprocess.run(
+        ["ps", "-p", str(pid), "-o", "command="],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    command_line = result.stdout.strip()
+    return command_line or None
+
+
+def is_same_project_server_process(
+    pid: int,
+    project_root: Path | None = None,
+) -> bool:
+    """
+    Check whether a process appears to be this project's server instance.
+
+    Args:
+        pid: Process identifier.
+        project_root: Optional project root override for testing.
+
+    Returns:
+        True if the process command line matches this project, otherwise False.
+    """
+    command_line = get_process_command_line(pid)
+    if not command_line:
+        return False
+
+    normalized_command = command_line.replace("\\", "/").lower()
+    resolved_project_root = (project_root or Path(__file__).resolve().parent).as_posix().lower()
+    resolved_main_path = Path(__file__).resolve().as_posix().lower()
+    expected_main_path = f"{resolved_project_root}/main.py"
+    has_project_root = resolved_project_root in normalized_command
+    has_main_script = " main.py" in normalized_command or normalized_command.endswith("/main.py")
+
+    return (
+        resolved_main_path in normalized_command
+        or expected_main_path in normalized_command
+        or (has_project_root and has_main_script)
+    )
+
+
+def ensure_clean_startup_port(
+    host: str,
+    port: int,
+    pid_file_path: Path | None = None,
+    current_pid: int | None = None,
+) -> None:
+    """
+    Stop the previous server instance from this project if it blocks startup.
+
+    Args:
+        host: Target bind host.
+        port: Preferred startup port.
+        pid_file_path: Optional runtime metadata file path override.
+        current_pid: Optional PID override for testing.
+    """
+    runtime_file_path = pid_file_path or get_server_runtime_file_path()
+    active_pid = current_pid or os.getpid()
+
+    previous_pid, previous_port = read_server_runtime_info(runtime_file_path)
+    tracked_port = previous_port or port
+
+    if previous_pid is not None and previous_pid != active_pid:
+        if process_exists(previous_pid) and is_port_in_use(host, tracked_port):
+            logger.info(
+                f"Stopping previous tracked server instance {previous_pid} on port {tracked_port}"
+            )
+            terminate_process(previous_pid)
+            wait_for_port_release(host, tracked_port)
+        remove_server_runtime_file(runtime_file_path)
+
+    if not is_port_in_use(host, port):
+        return
+
+    listener_pid = find_listening_pid_for_port(host, port)
+    if listener_pid is None or listener_pid == active_pid:
+        return
+
+    if not is_same_project_server_process(listener_pid):
+        logger.info(f"Port {port} is occupied by another program and will be preserved")
+        return
+
+    logger.info(f"Stopping previous project server instance {listener_pid} on port {port}")
+    terminate_process(listener_pid)
+    if wait_for_port_release(host, port):
+        logger.info(f"Port {port} released successfully")
+    else:
+        logger.warning(f"Port {port} is still occupied after stopping project process")
+
+
+def find_next_available_port(host: str, start_port: int) -> int:
+    """
+    Find the next available port starting from a given value.
+
+    Args:
+        host: Host to probe.
+        start_port: First candidate port to try.
+
+    Returns:
+        First available port.
+
+    Raises:
+        RuntimeError: If no free port is found within scan limit.
+    """
+    for candidate_port in range(start_port, start_port + MAX_PORT_SCAN_ATTEMPTS):
+        if not is_port_in_use(host, candidate_port):
+            return candidate_port
+
+    raise RuntimeError(
+        f"Could not find an available port between {start_port} and "
+        f"{start_port + MAX_PORT_SCAN_ATTEMPTS - 1}"
+    )
+
+
+def resolve_startup_port(
+    host: str,
+    preferred_port: int,
+    pid_file_path: Path | None = None,
+    current_pid: int | None = None,
+) -> int:
+    """
+    Resolve the final startup port while preserving unrelated programs.
+
+    Args:
+        host: Target bind host.
+        preferred_port: Preferred port from configuration.
+        pid_file_path: Optional runtime metadata file path override.
+        current_pid: Optional PID override for testing.
+
+    Returns:
+        Final startup port.
+    """
+    runtime_file_path = pid_file_path or get_server_runtime_file_path()
+    ensure_clean_startup_port(
+        host,
+        preferred_port,
+        pid_file_path=runtime_file_path,
+        current_pid=current_pid,
+    )
+
+    if not is_port_in_use(host, preferred_port):
+        return preferred_port
+
+    fallback_port = find_next_available_port(host, preferred_port + 1)
+    logger.warning(
+        f"Preferred port {preferred_port} is occupied by another program. "
+        f"Using fallback port {fallback_port} instead."
+    )
+    return fallback_port
+
 
 def parse_cli_args() -> argparse.Namespace:
     """
@@ -777,16 +1229,22 @@ if __name__ == "__main__":
     
     # Resolve final configuration with priority hierarchy
     final_host, final_port = resolve_server_config(args)
+    runtime_file_path = get_server_runtime_file_path()
+    final_port = resolve_startup_port(final_host, final_port, pid_file_path=runtime_file_path)
+    write_server_runtime_info(runtime_file_path, final_port)
     
     # Print startup banner
     print_startup_banner(final_host, final_port)
     
     logger.info(f"Starting Uvicorn server on {final_host}:{final_port}...")
     
-    # Use string reference to avoid double module import
-    uvicorn.run(
-        "main:app",
-        host=final_host,
-        port=final_port,
-        log_config=UVICORN_LOG_CONFIG,
-    )
+    try:
+        # Use string reference to avoid double module import
+        uvicorn.run(
+            "main:app",
+            host=final_host,
+            port=final_port,
+            log_config=UVICORN_LOG_CONFIG,
+        )
+    finally:
+        cleanup_server_runtime_info(runtime_file_path)

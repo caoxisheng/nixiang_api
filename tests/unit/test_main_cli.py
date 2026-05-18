@@ -8,6 +8,7 @@ Tests for parse_cli_args(), resolve_server_config(), and print_startup_banner().
 import pytest
 import argparse
 import sys
+from pathlib import Path
 from unittest.mock import patch, MagicMock
 from io import StringIO
 
@@ -257,6 +258,191 @@ class TestResolveServerConfig:
         print(f"Comparing: Expected ('192.168.1.1', 5000)")
         assert host == "192.168.1.1"  # From env (different from default)
         assert port == 5000  # From CLI
+
+
+class TestEnsureCleanStartupPort:
+    """Tests for ensure_clean_startup_port() startup cleanup behavior."""
+
+    def test_terminates_previous_process_from_pid_file(self, tmp_path):
+        """
+        What it does: Verifies that previous server PID from pid file is terminated.
+        Purpose: Ensure restart reuses the default port by stopping the old instance first.
+        """
+        print("Setup: Importing ensure_clean_startup_port...")
+        from main import ensure_clean_startup_port
+
+        print("Setup: Creating pid file with previous process id...")
+        pid_file = tmp_path / "server.pid"
+        pid_file.write_text("12345", encoding="utf-8")
+
+        with patch("main.is_port_in_use", return_value=True), \
+             patch("main.process_exists", return_value=True), \
+             patch("main.terminate_process") as mock_terminate, \
+             patch("main.wait_for_port_release", return_value=True), \
+             patch("main.find_listening_pid_for_port", return_value=None):
+            print("Action: Calling ensure_clean_startup_port...")
+            ensure_clean_startup_port(
+                "127.0.0.1",
+                8000,
+                pid_file_path=pid_file,
+                current_pid=54321,
+            )
+
+        print(f"Comparing: Expected terminate_process called with 12345")
+        mock_terminate.assert_called_once_with(12345)
+        assert not pid_file.exists()
+
+    def test_terminates_previous_process_found_by_port_scan(self, tmp_path):
+        """
+        What it does: Verifies fallback cleanup by scanning the listening port.
+        Purpose: Ensure old instances started before pid-file support are still cleaned up.
+        """
+        print("Setup: Importing ensure_clean_startup_port...")
+        from main import ensure_clean_startup_port
+
+        pid_file = tmp_path / "server.pid"
+
+        with patch("main.is_port_in_use", return_value=True), \
+             patch("main.process_exists", return_value=True), \
+             patch("main.find_listening_pid_for_port", return_value=23456), \
+             patch("main.is_same_project_server_process", return_value=True), \
+             patch("main.terminate_process") as mock_terminate, \
+             patch("main.wait_for_port_release", return_value=True):
+            print("Action: Calling ensure_clean_startup_port without pid file...")
+            ensure_clean_startup_port(
+                "127.0.0.1",
+                8000,
+                pid_file_path=pid_file,
+                current_pid=54321,
+            )
+
+        print("Comparing: Expected fallback process termination")
+        mock_terminate.assert_called_once_with(23456)
+
+    def test_does_not_terminate_unrelated_process(self, tmp_path):
+        """
+        What it does: Verifies that unrelated listeners are not terminated.
+        Purpose: Prevent accidental shutdown of non-project services using the same port.
+        """
+        print("Setup: Importing ensure_clean_startup_port...")
+        from main import ensure_clean_startup_port
+
+        pid_file = tmp_path / "server.pid"
+
+        with patch("main.is_port_in_use", return_value=True), \
+             patch("main.find_listening_pid_for_port", return_value=34567), \
+             patch("main.is_same_project_server_process", return_value=False), \
+             patch("main.terminate_process") as mock_terminate:
+            print("Action: Calling ensure_clean_startup_port with unrelated process...")
+            ensure_clean_startup_port(
+                "127.0.0.1",
+                8000,
+                pid_file_path=pid_file,
+                current_pid=54321,
+            )
+
+        print("Comparing: Expected unrelated process to be left running")
+        mock_terminate.assert_not_called()
+
+    def test_skips_cleanup_when_port_is_free(self, tmp_path):
+        """
+        What it does: Verifies that no cleanup happens when target port is free.
+        Purpose: Avoid unnecessary process inspection on normal starts.
+        """
+        print("Setup: Importing ensure_clean_startup_port...")
+        from main import ensure_clean_startup_port
+
+        pid_file = tmp_path / "server.pid"
+
+        with patch("main.is_port_in_use", return_value=False), \
+             patch("main.terminate_process") as mock_terminate, \
+             patch("main.find_listening_pid_for_port") as mock_find_pid:
+            print("Action: Calling ensure_clean_startup_port with free port...")
+            ensure_clean_startup_port(
+                "127.0.0.1",
+                8000,
+                pid_file_path=pid_file,
+                current_pid=54321,
+            )
+
+        print("Comparing: Expected no cleanup actions")
+        mock_terminate.assert_not_called()
+        mock_find_pid.assert_not_called()
+
+
+class TestResolveStartupPort:
+    """Tests for resolve_startup_port() port fallback behavior."""
+
+    def test_returns_preferred_port_when_available(self, tmp_path):
+        """
+        What it does: Verifies that preferred port is kept when it is free.
+        Purpose: Ensure normal startup still honors .env or CLI port settings.
+        """
+        print("Setup: Importing resolve_startup_port...")
+        from main import resolve_startup_port
+
+        pid_file = tmp_path / "server.pid"
+
+        with patch("main.ensure_clean_startup_port") as mock_cleanup, \
+             patch("main.is_port_in_use", return_value=False):
+            print("Action: Calling resolve_startup_port with available port...")
+            resolved_port = resolve_startup_port(
+                "127.0.0.1",
+                8000,
+                pid_file_path=pid_file,
+                current_pid=54321,
+            )
+
+        print(f"Comparing: Expected 8000, Got {resolved_port}")
+        mock_cleanup.assert_called_once()
+        assert resolved_port == 8000
+
+    def test_falls_back_to_next_available_port_for_unrelated_process(self, tmp_path):
+        """
+        What it does: Verifies fallback to next free port when another program uses preferred port.
+        Purpose: Ensure startup avoids killing unrelated services.
+        """
+        print("Setup: Importing resolve_startup_port...")
+        from main import resolve_startup_port
+
+        pid_file = tmp_path / "server.pid"
+
+        with patch("main.ensure_clean_startup_port"), \
+             patch("main.is_port_in_use", return_value=True), \
+             patch("main.find_next_available_port", return_value=8001) as mock_find_next:
+            print("Action: Calling resolve_startup_port with occupied preferred port...")
+            resolved_port = resolve_startup_port(
+                "127.0.0.1",
+                8000,
+                pid_file_path=pid_file,
+                current_pid=54321,
+            )
+
+        print(f"Comparing: Expected 8001, Got {resolved_port}")
+        mock_find_next.assert_called_once_with("127.0.0.1", 8001)
+        assert resolved_port == 8001
+
+
+class TestIsSameProjectServerProcess:
+    """Tests for is_same_project_server_process() command-line matching."""
+
+    def test_matches_relative_main_py_command_line(self):
+        """
+        What it does: Verifies matching when main.py appears as a relative argument.
+        Purpose: Ensure Windows launches like `python.exe main.py` are recognized.
+        """
+        print("Setup: Importing is_same_project_server_process...")
+        from main import is_same_project_server_process
+
+        project_root = Path("C:/Users/Xi/Desktop/nixiang_api")
+        command_line = '"C:/Users/Xi/Desktop/nixiang_api/.venv/Scripts/python.exe" main.py'
+
+        with patch("main.get_process_command_line", return_value=command_line):
+            print("Action: Calling is_same_project_server_process...")
+            result = is_same_project_server_process(12345, project_root=project_root)
+
+        print(f"Comparing: Expected True, Got {result}")
+        assert result is True
 
 
 class TestPrintStartupBanner:
