@@ -34,3 +34,10 @@ requests/
 .pytest_cache/
 .coverage
 htmlcov/
+
+# Server deployment secrets/runtime
+deploy/ecs/.env.server
+deploy/ecs/runtime/credentials.json
+deploy/ecs/runtime/state.json
+deploy/ecs/secrets/
+deploy/ecs/debug_logs/

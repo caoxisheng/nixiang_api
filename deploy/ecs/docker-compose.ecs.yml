@@ -1,0 +1,27 @@
+version: "3.8"
+
+services:
+  kiro-gateway:
+    build:
+      context: ../..
+      dockerfile: Dockerfile
+    container_name: kiro-gateway
+    env_file:
+      - .env.server
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./runtime:/app/runtime
+      - ./secrets:/app/secrets:ro
+      - ./debug_logs:/app/debug_logs
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import httpx; httpx.get('http://localhost:8000/health', timeout=5)"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+
+networks:
+  default:
+    name: kiro-gateway-network
